@@ -1,11 +1,11 @@
 ---
 name: qhhoj
-description: "Operates a qhhoj/online-judge site (VNOJ-family fork of DMOJ, Django) over HTTP given only a site URL and an account: logs in (including TOTP 2FA), creates/edits/clones problems with PDF statements, materials, editorials and per-language limits, uploads test data zips, imports Codeforces Polygon packages, creates/edits contests with problems, posts announcements, registers/joins contests, submits solutions and polls verdicts, rejudges/rescores, uploads into private organizations the account administers, and reads data via /api/v2. Use when asked to create a contest, upload or fix a problem, submit code, or manage any DMOJ/VNOJ-style online judge site (qhhoj, VNOJ, DMOJ) with credentials."
+description: "Operates a qhhoj/online-judge site (VNOJ-family fork of DMOJ, Django) over HTTP given only a site URL and an account: logs in (TOTP 2FA, or stateless Bearer-token mode that bypasses CSRF), creates/edits/clones problems with PDF statements, materials, editorials and per-language limits, uploads test data zips, imports Codeforces Polygon packages, creates/edits contests with problems, posts announcements, registers/joins contests, submits code and polls per-case verdicts, rejudges/aborts, comments, votes, writes blog posts, opens tickets, tags problems from external judges, uploads into private organizations the account administers, and reads everything via /api/v2. Use when asked to create a contest, upload or fix a problem, submit code, or manage any DMOJ/VNOJ-style online judge site (qhhoj, VNOJ, DMOJ) with credentials."
 license: AGPL-3.0
 compatibility: "Requires Python 3 with requests (pyotp optional for TOTP 2FA) and network access to the online judge site"
 metadata:
   author: qhhoj-skill
-  version: "1.2.0"
+  version: "1.3.0"
   argument-hint: "<site_url> <action>"
 ---
 

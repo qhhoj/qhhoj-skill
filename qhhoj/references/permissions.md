@@ -35,7 +35,11 @@ Enforcement: `PermissionRequiredMixin` (403 page), `LoginRequiredMixin`
 | Markdown image upload | staff or `judge.can_upload_image` (endpoint broken on master — see endpoints.md) |
 | Edit any organization | `judge.edit_all_organization` |
 | Spam-rejudge submission | `judge.rejudge_submission` |
-| Any admin action (`/admin/`) | `is_staff` (+ per-model perms) / superuser |
+| Abort others' submissions | `judge.abort_any_submission` (own queued ones always) |
+| Create tag problems | `profile.allow_tagging` + (`judge.add_tagproblem` or rating ≥ `VNOJ_TAG_PROBLEM_MIN_RATING` = 1900) |
+| Global/pinned blog posts | `judge.mark_global_post` / `judge.pin_post` |
+| Ban users | `judge.ban_user` (never superusers) |
+| Edit any comment / hide | `judge.change_comment` |
 
 Superuser implicitly holds everything. Typical site roles: "Problem Setter"
 group gets add/edit-own problem perms; "Contest Organizer" gets add/edit-own
@@ -59,7 +63,10 @@ Verified error texts (safe to match): "Contest duration cannot be longer than
 This field is required.", "Contest problem with this Problem and Contest
 already exists.", "Solution with this Associated problem already exists.",
 "Language-specific resource limit with this Problem and Language already
-exists.", "pandoc version must be at least 3.0.0".
+exists.", "pandoc version must be at least 3.0.0", "You need to have solved
+at least 5 problems before your voice can be heard.", "You cannot vote your
+own blog", "You cannot vote twice.", "You are not allowed to tag problem.",
+"Your part is silent, little toad." (banned/muted).
 
 ## Troubleshooting matrix
 

@@ -19,6 +19,17 @@ full behavior needs infra not present in verification env).
 | Register | `POST /accounts/register/` | `username` (`^\w+$`, ≤30), `full_name`?, `email` (unique, no throwaway domains), `password1`, `password2`, `timezone`, `language` (Language pk), `organizations`?, optional newsletter/captcha. Activation email → `GET /accounts/activate/<key>/` (skip if `SEND_ACTIVATION_EMAIL=False`). **[C]** |
 | Session probe | `GET /edit/profile/` | 200 = authenticated; 302 login = not. **[V]** |
 
+### Bearer token — stateless mode **[V]**
+
+`POST /accounts/api/token/generate/` (CSRF token from any page — this view is
+POST-only) → `{"data": {"token": "<48 chars>"}}`. Afterwards send
+`Authorization: Bearer <token>` on every request: the site's `APIMiddleware`
+authenticates you and **bypasses CSRF and the 2FA gate** — plain GET+POST to
+any endpoint (form endpoints and `/api/v2` alike), no cookies needed. `/admin/`
+is blocked with this header; invalid token → 401. Revoke with
+`POST /accounts/api/token/remove/`. Related: `POST
+/accounts/2fa/scratchcode/generate/` returns fresh scratch codes.
+
 ## Read API (`/api/v2`, only if `VNOJ_ENABLE_API=True` — probe with
 `GET /api/v2/contests`; 404 = disabled → fall back to HTML pages)
 
@@ -198,13 +209,6 @@ to Imgur).
 | `description` | Markdown |
 | `is_private`, `private_contestants` | private + user list (PKs via select2 `profile`) |
 | `auto_judge` | checkbox (Final-Submission-Only format) |
-| `contest_problems-TOTAL_FORMS/-INITIAL_FORMS/-MIN_NUM_FORMS/-MAX_NUM_FORMS` | management form |
-| `contest_problems-<i>-problem` / `-points` / `-order` / `-max_submissions` | problem **PK** (select2), points, distinct order, blank = unlimited |
-
-Duration cap: 14 days unless `judge.long_contest_duration` (verified error:
-"Contest duration cannot be longer than 14 days"). Creator becomes **author**.
-
-### Edit **[V]**
 `POST /contest/<key>/edit` (author/curator) — same fields. Problem-list
 reconciliation rules (verified):
 - Existing rows must be echoed with `contest_problems-<i>-id` (from GET page).
@@ -231,10 +235,85 @@ reconciliation rules (verified):
 | Language list | `GET /problem/<code>/submit` → `<select id="id_language" name="language">` options = `<pk>`/`<name>` **[V]** | Options = problem's `usable_languages` (allowed ∩ judges online). No select rendered = "No judge is available" — cannot submit |
 | Submit | `POST /problem/<code>/submit` `language=<pk>` `source=<code>` **[V]** | or `submission_file` (file upload; extension must match language) + empty `source`. Redirects to `/submission/<id>` |
 | Status | `GET /submission/<id>` HTML; JSON via `/api/v2/submission/<id>` (login required) **[V]** | result codes: `AC` `WA` `TLE` `MLE` `RE` `CE` `IE` …; poll until not `QU`/`P` |
-| Status row fragment | `GET /widgets/single_submission?id=<id>&show_problem=1` **[V]** (path) | HTML row incl. verdict; works when API off; also `GET /widgets/submission_testcases?id=<id>` for case results |
+| Status row fragment | `GET /widgets/single_submission?id=<id>&show_problem=1` **[V]** | HTML row incl. verdict; works when API off |
+| Per-case results | `GET /widgets/submission_testcases?id=<id>` **[V]** | case-by-case status/score table |
+| Source view | `GET /src/<id>` page, `/src/<id>/raw` plain text **[V]** | `/src/<id>/download` 404 unless the language is file-only (by design) |
+| Abort | `POST /submission/<id>/abort` **[V]** | queued/running subs only; already-rejudged refused; needs the site's judge bridge up |
+| Rejudge one | `POST /widgets/rejudge` `id=<sid>` **[V]** | perm `judge.rejudge_submission`; 302 back |
+| Reject (mod) | `POST /widgets/reject` `id=<sid>` | moderator tool |
+| Language template | `GET /widgets/template?id=<lang_pk>` **[V]** | default skeleton source for a language |
+| Listings | `GET /submissions/`, `/submissions/user/<user>/`, `/submissions/diff` | HTML feeds; contest-scoped under `/contest/<key>/submissions/…` |
 
 Rate limits: per-problem submission throttling applies between submissions —
 retry on the throttle page/`ignore` message.
+
+## Comments **[V]**
+
+Posting = POST the commented page itself (problem/contest/blog/tag pages).
+
+| Op | Call | Fields / notes |
+|---|---|---|
+| Post | `POST /problem/<code>` (or other commented page) | `body` (Markdown), `parent` (comment id for replies) → 302 |
+| Vote | `POST /comments/upvote` / `/comments/downvote` | `id` → 200 `success`; 400 on own/double vote |
+| Edit | `POST /comments/<id>/edit` | `body`, `parent` (own comment or `judge.change_comment`) → 302 `#comment-<id>` |
+| Rendered | `GET /comments/<id>/render` | final HTML |
+| History | `GET /comments/<id>/history/ajax`, `votes/ajax` | revisions / voters |
+| Hide (mod) | `POST /comments/hide` `id=<cid>` | `judge.change_comment` |
+
+Gate: accounts need ≥ `VNOJ_INTERACT_MIN_PROBLEM_COUNT` (default 5) solved
+problems before commenting/voting ("You need to have solved at least N
+problems before your voice can be heard." / "You must solve at least N
+problems before you can vote.").
+
+## Blog / news posts **[V]**
+
+| Op | Call | Fields / notes |
+|---|---|---|
+| Create | `POST /posts/new` (global) or `/organization/<slug>/post/new` | `title`, `publish_on` (`%Y-%m-%d %H:%M:%S`), `visible`, `global_post` (perm `judge.mark_global_post`), `sticky` (perm `judge.pin_post`), `content` → 302 `/post/<id>-<slug>` (slug = author name initially) |
+| Edit | `POST /post/<id>-<slug>/edit` | same fields |
+| Delete | `POST /post/<id>-<slug>/delete` | author |
+| Vote | `POST /posts/upvote` / `/posts/downvote` | `id` → 200 `success`; 400 own post/double vote ("You cannot vote your own blog") |
+
+## Tickets (problem feedback) **[V]**
+
+| Op | Call | Fields |
+|---|---|---|
+| Open | `POST /problem/<code>/tickets/new` (or `/tickets/new` general) | `title` (≤100), `issue_url`?, `body` → 302 `/ticket/<id>` |
+| List | `GET /tickets/` (own) | staff see all |
+| Detail | `GET /ticket/<id>` | reply/post follow-ups on the same page |
+
+## Tags (VNOJ tag system) **[V]**
+
+Tags classify *external* problems (Codeforces, AtCoder, …) mirrored into a
+TagProblem registry; site problems link to it.
+
+| Op | Call | Notes |
+|---|---|---|
+| Create from URL | `POST /tags/create` `problem_url=<external url>` | server fetches metadata from the external judge → 302 `/tag/<CODE>` (e.g. `CF_4_A`); existing → same redirect |
+| Assign tags | `POST /tag/<code>/assign` `tags=<code1>&tags=<code2>` | tag codes from `/judge-select2/tag/?term=` |
+| Browse | `GET /tags/`, `/tags/find?find=<text>`, `/tags/random/`, `/tag/<code>` | |
+
+Gate: `profile.allow_tagging` (admin-granted) **and** (`judge.add_tagproblem`
+perm or rating ≥ `VNOJ_TAG_PROBLEM_MIN_RATING` = 1900). The create step needs
+the server to reach the external judge APIs.
+
+## Markdown preview & templates **[V]**
+
+`POST /widgets/preview/<kind>` field `content` → rendered HTML. kind ∈
+`default`, `problem`, `blog`, `contest`, `comment`, `flatpage`, `profile`,
+`organization`, `solution`, `license`, `ticket`. Views are POST-only — take
+the CSRF token from another page (or use Bearer mode). Useful to sanity-check
+statements/MathJax before saving.
+
+## User tools
+
+| Op | Call | Fields / notes |
+|---|---|---|
+| Edit own profile | `POST /edit/profile/` **[V]** | `first_name`, `about`, `timezone`, `language` (pk), `site_theme`, `ace_theme`, `test_site`, `organizations` — select fields are required (parse from page) |
+| Ban / unban | `POST /user/<u>/ban` `ban_reason=…` / `POST /user/<u>/unban` **[V]** | perm `judge.ban_user`, cannot hit superusers |
+| Data export | `POST /data/prepare/` → poll → `/data/download/` | comments/submissions dump |
+| Scratch codes | `POST /accounts/2fa/scratchcode/generate/` **[V]** | fresh codes JSON |
+| Status pages | `GET /status/`, `/runtimes/`, `/contests.ics` **[V]** | judge table / language matrix / calendar |
 
 ## Pages worth scraping (API-less fallbacks)
 

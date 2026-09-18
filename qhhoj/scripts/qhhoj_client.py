@@ -42,7 +42,7 @@ class QhhojClient:
         self.totp_secret = totp_secret
         self.timeout = timeout
         self.s = requests.Session()
-        self.api_enabled: Optional[bool] = None
+        self.token: Optional[str] = None
 
     # ---------------- low-level helpers ----------------
 
@@ -60,15 +60,20 @@ class QhhojClient:
             raise QhhojError('csrfmiddlewaretoken not found on page')
         return m.group(1)
 
-    def post(self, path: str, data: dict, files: Optional[dict] = None):
-        """GET page for a fresh CSRF token, then POST without following redirects.
+    def post(self, path: str, data: dict, files: Optional[dict] = None,
+             csrf_path: str = None):
+        """Fetch a page for a fresh CSRF token, then POST without following
+        redirects. Returns the raw 30x response on success; a 200 response
+        means the form re-rendered with validation errors.
 
-        Returns the raw 30x response on success (check .status_code in (301, 302)).
-        A 200 response means the form re-rendered with validation errors.
+        `csrf_path`: where to read the CSRF token from when the target itself
+        has no GET form (POST-only AJAX endpoints: previews, api/token/…) —
+        pass '/' or any readable page. Ignored in Bearer-token mode.
         """
-        page = self.get(path)
         payload = dict(data)
-        payload['csrfmiddlewaretoken'] = self._csrf(page.text)
+        if not self.token:
+            page = self.get(csrf_path or path)
+            payload['csrfmiddlewaretoken'] = self._csrf(page.text)
         return self.s.post(self.url(path), data=payload, files=files,
                            allow_redirects=False,
                            headers={'Referer': self.url(path)},
@@ -587,6 +592,180 @@ class QhhojClient:
             raise QhhojError('submit failed: %s' % self.form_errors(r.text))
         m = re.search(r'/submission/(\d+)', r.headers.get('Location', ''))
         return int(m.group(1)) if m else -1
+
+    # ---------------- bearer token (stateless mode) ----------------
+
+    def api_token(self) -> str:
+        """POST /accounts/api/token/generate/ -> 48-char token. With the header
+        `Authorization: Bearer <token>` every request (GET and POST, including
+        form endpoints and /api/v2) authenticates statelessly — CSRF and 2FA
+        are bypassed by the site's APIMiddleware (except /admin/).
+        """
+        r = self.post('/accounts/api/token/generate/', {}, csrf_path='/')
+        if r.status_code != 200:
+            raise QhhojError('token generation failed: %s' % r.status_code)
+        self.token = r.json()['data']['token']
+        self.s.headers['Authorization'] = 'Bearer ' + self.token
+        return self.token
+
+    # ---------------- submission tools ----------------
+
+    def submission_source(self, sid: int) -> str:
+        """Raw submitted source: GET /src/<id>/raw.
+        (/src/<id>/download works only for file-only languages.)"""
+        r = self.get('/src/%d/raw' % sid)
+        r.raise_for_status()
+        return r.text
+
+    def submission_testcases(self, sid: int) -> str:
+        """Per-case results table HTML: GET /widgets/submission_testcases?id="""
+        return self.get('/widgets/submission_testcases', params={'id': sid}).text
+
+    def rejudge_submission(self, sid: int) -> None:
+        """POST /widgets/rejudge (id) — needs judge.rejudge_submission."""
+        r = self.post('/widgets/rejudge', {'id': sid}, csrf_path='/')
+        if r.status_code not in (301, 302):
+            raise QhhojError('rejudge failed: %s %s' % (r.status_code, r.text[:80]))
+
+    def abort_submission(self, sid: int) -> None:
+        r = self.post('/submission/%d/abort' % sid, {})
+        if r.status_code not in (301, 302):
+            raise QhhojError('abort failed: %s' % self.form_errors(r.text))
+
+    def language_template(self, language_pk) -> str:
+        """Default template source for a language (GET /widgets/template?id=)."""
+        return self.get('/widgets/template', params={'id': language_pk}).text
+
+    # ---------------- markdown preview ----------------
+
+    def preview_markdown(self, content: str, kind: str = 'problem') -> str:
+        """Rendered HTML for Markdown (MathJax/syntax aware per context).
+        kind: default | problem | blog | contest | comment | flatpage |
+              profile | organization | solution | license | ticket
+        POST-only view — CSRF token is read from the home page."""
+        r = self.post('/widgets/preview/%s' % kind, {'content': content},
+                      csrf_path='/')
+        if r.status_code != 200:
+            raise QhhojError('preview failed: %s' % r.status_code)
+        return r.text
+
+    # ---------------- comments ----------------
+
+    def comment(self, page_path: str, body: str, parent: int = None) -> None:
+        """Post a comment by POSTing the commented page itself (problem,
+        contest, blog, tag pages…). Fields: body, parent (comment id).
+        Requires >= VNOJ_INTERACT_MIN_PROBLEM_COUNT solved problems."""
+        r = self.post(page_path, {'body': body, 'parent': parent or ''})
+        if r.status_code not in (301, 302):
+            raise QhhojError('comment failed: %s' % self.form_errors(r.text))
+
+
+    def vote_comment(self, cid: int, up: bool = True) -> None:
+        """Vote endpoints answer 200 'success' (400 on rule violations:
+        own content, double vote, too-few-solves)."""
+        r = self.post('/comments/%svote' % ('up' if up else 'down'),
+                      {'id': cid}, csrf_path='/')
+        if r.status_code != 200 or 'success' not in r.text:
+            raise QhhojError('vote failed: %s %s' % (r.status_code, r.text[:60]))
+
+    # ---------------- blog ----------------
+
+    def blog_post(self, title: str, content: str, visible: bool = True,
+                  global_post: bool = False, sticky: bool = False,
+                  publish_on: str = None, org_slug: str = '') -> str:
+        """Create a blog post -> returns its URL path. global_post needs
+        judge.mark_global_post, sticky needs judge.pin_post."""
+        from datetime import datetime
+        path = ('/organization/%s/post/new' % org_slug) if org_slug else '/posts/new'
+        r = self.post(path, {
+            'title': title,
+            'publish_on': publish_on or datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+            'visible': 'on' if visible else '',
+            'global_post': 'on' if global_post else '',
+            'sticky': 'on' if sticky else '',
+            'content': content,
+        })
+        if r.status_code not in (301, 302):
+            raise QhhojError('blog_post failed: %s' % self.form_errors(r.text))
+        return r.headers.get('Location', '')
+
+    def edit_blog_post(self, post_path: str, title: str, content: str,
+                       **kw) -> None:
+        r = self.post(post_path.rstrip('/') + '/edit', {
+            'title': title,
+            'publish_on': kw.get('publish_on') or '2026-01-01 00:00:00',
+            'visible': 'on' if kw.get('visible', True) else '',
+            'global_post': 'on' if kw.get('global_post') else '',
+            'sticky': 'on' if kw.get('sticky') else '',
+            'content': content,
+        })
+        if r.status_code not in (301, 302):
+            raise QhhojError('edit blog failed: %s' % self.form_errors(r.text))
+
+    def vote_blog(self, post_id: int, up: bool = True) -> None:
+        r = self.post('/posts/%svote' % ('up' if up else 'down'),
+                      {'id': post_id}, csrf_path='/')
+        if r.status_code != 200 or 'success' not in r.text:
+            raise QhhojError('blog vote failed: %s %s' % (r.status_code, r.text[:60]))
+
+    # ---------------- tickets ----------------
+
+    def ticket(self, problem_code: str, title: str, body: str,
+               issue_url: str = '') -> str:
+        """Open a ticket against a problem -> returns ticket URL."""
+        r = self.post('/problem/%s/tickets/new' % problem_code,
+                      {'title': title, 'issue_url': issue_url, 'body': body})
+        if r.status_code not in (301, 302):
+            raise QhhojError('ticket failed: %s' % self.form_errors(r.text))
+        return r.headers.get('Location', '')
+
+    # ---------------- tagging (VNOJ tag system) ----------------
+
+    def tag_from_url(self, problem_url: str) -> str:
+        """POST /tags/create with an external problem URL (Codeforces, AtCoder,
+        …) — server fetches metadata and creates a TagProblem; returns its
+        path (/tag/<CODE>). Gate: profile.allow_tagging AND (perm
+        judge.add_tagproblem OR rating >= VNOJ_TAG_PROBLEM_MIN_RATING)."""
+        r = self.post('/tags/create', {'problem_url': problem_url})
+        if r.status_code not in (301, 302):
+            raise QhhojError('tag create failed: %s' % self.form_errors(r.text))
+        return r.headers.get('Location', '')
+
+    def assign_tags(self, tag_problem: str, tags: list) -> None:
+        """POST /tag/<code>/assign with tag codes, e.g. ['dp', 'math']."""
+        r = self.post('/tag/%s/assign' % tag_problem.lstrip('/tag/').strip('/'),
+                      {'tags': tags})
+        if r.status_code not in (301, 302):
+            raise QhhojError('assign tags failed: %s' % self.form_errors(r.text))
+
+    # ---------------- user tools ----------------
+
+    def edit_profile(self, first_name: str = None, about: str = None,
+                     timezone: str = None, language_pk=None) -> None:
+        """POST /edit/profile/ — all select fields are required (parse page)."""
+        page = self.get('/edit/profile/')
+        data = {}
+        for f in ('first_name', 'about', 'timezone'):
+            m = re.search(r'name="%s"[^>]*?(?:value="([^"]*)"|>([^<]*)<)' % f,
+                          page.text)
+            data[f] = locals().get(f) or (m.group(1) or m.group(2) if m else '')
+        for f in ('language', 'site_theme', 'ace_theme'):
+            cur = self.select_selected(page.text, f)
+            data[f] = str(language_pk) if (f == 'language' and language_pk) else cur
+        data['test_site'] = ''
+        r = self.post('/edit/profile/', data)
+        if r.status_code not in (301, 302):
+            raise QhhojError('edit_profile failed: %s' % self.form_errors(r.text))
+
+    def ban_user(self, username: str, reason: str) -> None:
+        r = self.post('/user/%s/ban' % username, {'ban_reason': reason})
+        if r.status_code not in (301, 302):
+            raise QhhojError('ban failed: %s' % self.form_errors(r.text))
+
+    def unban_user(self, username: str) -> None:
+        r = self.post('/user/%s/unban' % username, {})
+        if r.status_code not in (301, 302):
+            raise QhhojError('unban failed: %s' % self.form_errors(r.text))
 
 
 if __name__ == '__main__':

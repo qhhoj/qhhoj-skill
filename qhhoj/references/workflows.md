@@ -200,3 +200,52 @@ Both spawn async tasks — follow `/tasks/status/<id>` (HTML autorefresh).
 password2, timezone, language` (+ org list, newsletter, captcha when
 configured) → activation email if `SEND_ACTIVATION_EMAIL` →
 `GET /accounts/activate/<key>/`. Then login as usual.
+
+## 13. Stateless mode: Bearer token **[V]**
+
+For long agent sessions prefer a token over session+CSRF juggling:
+
+```python
+c.login()
+c.api_token()          # POST /accounts/api/token/generate/ (once)
+# from now on every c.get()/c.post() sends Authorization: Bearer <token>;
+# CSRF tokens and 2FA are bypassed by the site middleware
+```
+
+Notes: `/admin/` is unreachable with the header (site policy); invalid or
+revoked tokens → 401 (re-login and regenerate). Votes/AJAX endpoints answer
+HTTP 200 `success` (not 302).
+
+## 14. Social: comments, blog, tickets, tags **[V]**
+
+```python
+c.comment('/problem/demoprob', 'Bài hay, cảm ơn tác giả!')   # POST the page itself
+c.comment('/problem/demoprob', 'Phụ lục…', parent=<cid>)     # reply
+c.vote_comment(cid); c.edit_comment(cid, 'Nội dung mới.')
+
+loc = c.blog_post('Thông báo kỳ tập luyện', 'Nội dung **bài viết**.', global_post=True)
+c.edit_blog_post(loc, 'Tiêu đề (sửa)', 'Nội dung mới.')
+c.vote_blog(<post_id>)           # not your own post!
+
+c.ticket('demoprob', 'Sai đề bài', 'Chi tiết…')               # feedback to authors
+
+tags = c.tag_from_url('https://codeforces.com/problemset/problem/4/A')  # '/tag/CF_4_A'
+c.assign_tags(tags, ['math', 'greedy'])
+```
+
+Gates (site-wide): commenting/voting needs ≥ 5 solved problems
+(`VNOJ_INTERACT_MIN_PROBLEM_COUNT`); tagging needs `allow_tagging` on the
+profile plus perm or rating ≥ 1900. Markdown can be dry-run with
+`c.preview_markdown('…', 'problem')` before saving anywhere.
+
+## 15. Inspecting & managing submissions **[V]**
+
+```python
+print(c.submission_source(sid))          # GET /src/<id>/raw
+html = c.submission_testcases(sid)       # per-case verdicts
+c.rejudge_submission(sid)                # needs judge.rejudge_submission
+c.abort_submission(sid)                  # while queued/grading only
+# verdicts without /api/v2:
+#   GET /widgets/single_submission?id=<sid>   (status row HTML)
+#   d = c.api('submission/%d' % sid)          (JSON, needs auth)
+```
