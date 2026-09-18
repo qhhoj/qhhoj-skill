@@ -1,0 +1,176 @@
+# qhhoj workflow recipes
+
+Each recipe lists the client call (`scripts/qhhoj_client.py`) and the raw HTTP
+equivalent. Assume `c = QhhojClient(SITE, USER, PASS, totp_secret=…)` and
+`c.login()` succeeded.
+
+## 0. Connect & probe an unknown site
+
+```python
+c.login()                                  # raises on: bad creds, forced pw change, 2FA w/o secret
+api = c.api('contests')                    # None => /api/v2 disabled on this deployment
+print(c.logged_in(), 'api:', api is not None)
+```
+
+Raw: `GET /accounts/login/` (200 + DMOJ markup = right software), then
+`POST /accounts/login/`, then `GET /edit/profile/` (200 = auth OK), then
+`GET /api/v2/contests` (404 = API off).
+
+2FA accounts: `QhhojClient(..., totp_secret='<base32>')` — the client detects
+the `/2fa/` redirect and answers automatically. With only a scratch code,
+`POST /2fa/` once with `totp_or_scratch_code=<code>` manually.
+
+## 1. Capability discovery (what may this account do?)
+
+No permission-list endpoint exists. Probe (cheap → expensive):
+
+| Probe | 200/302 means |
+|---|---|
+| `GET /problems/create` | `judge.add_problem` (302→login = anonymous) |
+| `GET /problems/import-polygon` | `judge.import_polygon_package` |
+| `GET /contests/new` | `judge.add_contest` |
+| `GET /problem/<code>/edit` for own/other problems | curator/author of it, or staff |
+| `GET /contest/<key>/edit` | author/curator of it |
+| `GET /organization/<slug>/problem-create` | org admin (`judge.create_organization_problem`) |
+| `GET /admin/` | staff/superuser |
+
+Permission-denied renders a friendly 403 page — distinguishable from 302
+login redirect. Limits by permission: see `permissions.md`.
+
+## 2. Full problem upload (statement + tests) — general path
+
+```python
+c.create_problem(code='voi25_ab', name='VOI25 - A cộng B',
+                 time_limit_s=1.0, memory_limit_kb=262144, points=800,
+                 partial=True, description='## Đề bài\nCompute $A + B$.\n\n## Input\n...\n')
+c.make_zip({'1.in': '1 2\n', '1.ans': '3\n',
+            '2.in': '4 5\n', '2.ans': '9\n'}, '/tmp/tests.zip')
+c.upload_testdata('voi25_ab', zip_path='/tmp/tests.zip',
+                  cases=[('1.in', '1.ans', 50), ('2.in', '2.ans', 50)])
+```
+
+Raw essentials for the data POST (multipart): `problem-data-zipfile`,
+`problem-data-grader=standard`, `problem-data-checker=standard`,
+`problem-data-checker_type=default`, `problem-data-io_method=standard`,
+`mirror-test_source=local`, `external-enabled=` (empty),
+`cases-TOTAL_FORMS=2`, `cases-INITIAL_FORMS=0`, `cases-MAX_NUM_FORMS=1000`,
+and per case `cases-<i>-order/type=C/input_file/output_file/points`.
+**Never** include `problem-data-zipfile-clear`.
+
+Optional extras at create/edit time: `statement_file` (PDF), `problem_material_file`
+(zip of materials) — both permission-gated.
+
+### Custom checker
+`problem-data-checker=bridged` + `problem-data-custom_checker` (the checker
+source file, must be inside the zip or uploaded) + `problem-data-checker_type`
+(dialect). Float checkers: `floats`/`floatsabs`/`floatsrel` with
+`problem-data-checker_args` JSON, e.g. `{"precision": 6}`.
+
+### Modify existing tests
+`GET` the page first; echo `cases-<i>-id` for kept rows, add
+`cases-<i>-DELETE=on` for removed ones, append new rows with empty id
+(client's `upload_testdata` keeps existing rows and appends — call with only
+new `cases`; extend it for deletions).
+
+## 3. Upload from Codeforces Polygon package — one-shot path
+
+```python
+c.import_polygon('/tmp/problem.zip', code='cf_1234a')
+```
+Creates statement, tests, checker, solutions/tutorial automatically. For an
+existing problem: `POST /problem/<code>/update-polygon` (client: reuse
+`import_polygon` path swap). Requires Polygon package zip with `problem.xml`.
+
+## 4. Clone a problem (reuse tests)
+
+```python
+c.clone_problem('old_prob', 'new_prob')   # perm judge.clone_problem
+```
+
+## 5. Create a contest with problems
+
+```python
+pks = [(c.select2_problem(code)['id'], 100) for code in ['voi25_ab', 'voi25_cd']]
+c.create_contest(key='voi25', name='VOI 2025 — Day 1',
+                 duration_days=1.5, problems=pks,
+                 format_name='ioi', scoreboard_visibility='C',
+                 description='Regulations…', visible=True)
+```
+
+Raw: fields per `endpoints.md`; remember duration ≤ 14 days, distinct
+`order`, `problem` = PK.
+
+## 6. Edit a running contest / swap its problems
+
+```python
+keep = c.select2_problem('voi25_ab')['id']
+add  = c.select2_problem('voi25_cd')['id']
+c.edit_contest('voi25', problems=[(keep, 100), (add, 100)])
+```
+Client performs row reconciliation (echo ids; DELETE dropped rows; append new).
+Also `c.announce('voi25', 'Clarification', '<markdown>')`.
+
+## 7. Register / join a contest as a participant
+
+```python
+c.join_contest('voi25')                 # POST /contest/voi25/join
+c.join_contest('secret_contest', access_code='XYZ')   # access-code contests
+```
+Join works while ongoing; after `end_time` it creates a **virtual**
+participation (unless `disallow_virtual`).
+
+## 8. Submit solutions & poll verdict
+
+```python
+langs = c.languages('voi25_ab')            # [] => no judge online for it
+sid = c.submit('voi25_ab', 'print(int(input())+int(input()))')
+# or file: c.submit('voi25_ab', source='', file_path='sol.cpp', language_id=<id>)
+import time
+while True:
+    d = c.api('submission/%d' % sid)       # needs login; None if API off
+    st = d and d['object']['status']
+    print(st)
+    if st not in (None, 'QU', 'P', 'G'):   # queued/processing/grading
+        break
+    time.sleep(2)
+```
+API-less fallback: `GET /submission/<id>` HTML (status badge), or the row
+fragment `GET /submission/widgets/single_submission?id=<id>` returning the
+status table row HTML (auth needed; works when `/api/v2` is disabled).
+
+## 9. Read site data (problems/contests/users/rankings)
+
+```python
+for obj in c.api('problems', params={'search': 'voi'})['objects']: ...
+detail = c.api('contest/voi25')['object']   # problems[] + rankings[] (if allowed)
+```
+If `c.api(...)` returns None (feature flag off), scrape the HTML list pages
+(`/problems/`, `/contests/`, `/submissions/`, `/user/<name>/`).
+
+## 10. Organization-scoped work
+
+Org admins create content inside their org (auto-prefixed ids, org-private
+visibility):
+- `POST /organization/<slug>/problem-create` — like problem create + `is_public`
+  (org-visibility) checkbox; `code` must start `<orgslug>_`.
+- `POST /organization/<slug>/contest-create` — like contest create; `key` must
+  start `<orgslug>_`.
+- `GET /organization/<slug>/problems|contests` — org listings.
+Client: pass `org_path='/organization/<slug>'` to `create_problem` /
+`create_contest`.
+
+## 11. Rejudge / rescore after fixing tests (author tools) **[C]**
+
+```
+POST /problem/<code>/manage/submission/rejudge
+    use_range=on&start=1&end=999&language=<pk>&result=AC   # any subset
+POST /problem/<code>/manage/submission/rescore/all         # recompute points
+```
+Both spawn async tasks — follow `/tasks/status/<id>` (HTML autorefresh).
+
+## 12. Register a new account **[C]**
+
+`POST /accounts/register/` with `username, full_name?, email, password1,
+password2, timezone, language` (+ org list, newsletter, captcha when
+configured) → activation email if `SEND_ACTIVATION_EMAIL` →
+`GET /accounts/activate/<key>/`. Then login as usual.

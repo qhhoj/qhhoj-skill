@@ -1,0 +1,202 @@
+# qhhoj endpoint reference
+
+Base `SITE = https://<domain>`. All POSTs need `csrfmiddlewaretoken` (see
+SKILL.md mechanics) + session cookies + `Referer` header. Success = 302;
+failure = 200 with errorlist (unless noted otherwise).
+
+Legend: **[V]** = live-verified, **[C]** = from code (structure verified,
+full behavior needs infra not present in verification env).
+
+## Authentication
+
+| What | Method & path | Fields / notes |
+|---|---|---|
+| Login form | `GET /accounts/login/` | Parse CSRF (both quote styles). **[V]** |
+| Login | `POST /accounts/login/` | `username`, `password`, `next=/` → 302 `/`. **[V]** |
+| 2FA | `POST /2fa/` | `totp_or_scratch_code` = 6-digit TOTP (`pyotp.TOTP(secret).now()`) or a scratch code. Session flag `2fa_passed` set. **[V]** |
+| Password change (forced) | `POST /password/change/` | `old_password`, `new_password1`, `new_password2`. Forced when password is in breach lists. **[V]** |
+| Logout | `GET/POST /logout/` | n/a |
+| Register | `POST /accounts/register/` | `username` (`^\w+$`, ≤30), `full_name`?, `email` (unique, no throwaway domains), `password1`, `password2`, `timezone`, `language` (Language pk), `organizations`?, optional newsletter/captcha. Activation email → `GET /accounts/activate/<key>/` (skip if `SEND_ACTIVATION_EMAIL=False`). **[C]** |
+| Session probe | `GET /edit/profile/` | 200 = authenticated; 302 login = not. **[V]** |
+
+## Read API (`/api/v2`, only if `VNOJ_ENABLE_API=True` — probe with
+`GET /api/v2/contests`; 404 = disabled → fall back to HTML pages)
+
+Envelope: `{"api_version": "2.0", "method": "get", "fetched": "...", "data":
+{...}}`; errors: `{"error": {"code": <http>, "message": ...}}` with matching
+HTTP status (403 login required / permission, 404 not found, 400 bad filter).
+
+| Endpoint | Returns / filters |
+|---|---|
+| `GET /api/v2/contests` **[V]** | Visible contests; filters `key`, `tag`, `organization`, `is_rated`; `?page=N` |
+| `GET /api/v2/contest/<key>` **[V]** | Detail incl. `problems` [{code,name,points,partial,max_submissions,label}] (only when contest ended / in contest / editor) and `rankings` (permission-gated) |
+| `GET /api/v2/problems` **[V]** | Visible problems; filters `code`, `group`, `type`, `organization`, `partial`, `search` (FTS) |
+| `GET /api/v2/problem/<code>` | Detail (partial → fields on group/types/points) |
+| `GET /api/v2/users` / `user/<username>` | Public profiles (solved counts, rating, organizations) |
+| `GET /api/v2/submissions` **[V]** | Public submissions; filters `user`, `problem`, `result`, `language` |
+| `GET /api/v2/submission/<id>` | Detail — **requires login** (403 otherwise) |
+| `GET /api/v2/participations` | Contest participations; filters `contest` (key), `user`, `is_disqualified`, `virtual_participation_number`; scoreboard permission-gated |
+| `GET /api/v2/organizations` / `languages` / `judges` | Lists (languages: pk ↔ key ↔ name) |
+
+Page size: `DMOJ_API_PAGE_SIZE` (default 1000); `data.has_more` /
+`data.page_index` for pagination.
+
+## Select2 PK lookups (auth needed) **[V]**
+
+`GET /judge-select2/<kind>/?term=<text>` where kind ∈ `problem`, `contest`,
+`profile`, `organization`, `tag`, `taggroup`, `comment` →
+`{"results": [{"id": <pk>, "text": <label>}]}`. Only *visible* objects are
+searchable.
+
+## Problems
+
+### Create **[V]**
+`POST /problems/create` (perm `judge.add_problem`) — multipart if attaching files.
+
+| Field | Value |
+|---|---|
+| `code` | `^[a-z0-9_]+$`, unique |
+| `name` | display name |
+| `time_limit` | seconds (float); > site limit (default 5s) needs `judge.high_problem_timelimit` |
+| `memory_limit` | KB, default 262144 |
+| `points` | int (800–3500 suggested) |
+| `partial` | checkbox `on` = partial scoring |
+| `group` | ProblemGroup pk — parse options from the GET page (skip the empty first option) |
+| `types` | list of ProblemType pks (first non-empty option works) |
+| `source` | free text / origin URL |
+| `description` | Markdown (MathJax `$…$` OK) |
+| `statement_file` | file, PDF statement (perm `judge.upload_file_statement`) |
+| `problem_material_file` | file, materials for contestants (perm `judge.upload_problem_material`) |
+| `submission_source_visibility_mode` | `F` follow / `A` always / `S` solved |
+| `testcase_visibility_mode` | `A` author-only default / others |
+
+Notes: creator becomes **curator**. Global (non-org) create has **no**
+`is_public` field — the problem starts private; publishing global problems is
+a staff/admin action. Org variant: `POST /organization/<slug>/problem-create`
+(perm `judge.create_organization_problem`), adds `is_public` checkbox
+("public to org members"), code must start `<orgslug>_`.
+
+### Edit **[V]**
+`POST /problem/<code>/edit` — same fields, plus **always** send both inline
+formset management forms:
+`language_limits-TOTAL_FORMS/INITIAL_FORMS/MIN_NUM_FORMS/MAX_NUM_FORMS` and
+`solution-TOTAL_FORMS/…` (`0/0/0/1000` is valid). Omitting them fails with
+`(Hidden field TOTAL_FORMS) This field is required.`
+
+### Test data **[V]**
+`GET /problem/<code>/test_data` (author/curator/superuser) then
+`POST` multipart:
+
+| Field | Value |
+|---|---|
+| `problem-data-zipfile` | zip file (`1.in`, `1.ans`, … at any depth; checker/grader sources allowed) |
+| `problem-data-grader` | **required**: `standard` / `interactive` / `signature` / `output_only` |
+| `problem-data-checker` | `standard` / `floats` / `floatsabs` / `floatsrel` / `identical` / `bridged` (custom) |
+| `problem-data-checker_type` | checker dialect: `default` (DMOJ) / `testlib` / `themis` / `cms` / `coci` / `peg` |
+| `problem-data-custom_checker` | file, checker source (when `bridged`) |
+| `problem-data-custom_grader`, `problem-data-custom_header`, `problem-data-grader_args` | grader files / JSON args |
+| `problem-data-io_method` | `standard` / `file` (+ `io_input_file`, `io_output_file` names) |
+| `problem-data-output_limit` | int, blank = default |
+| `mirror-test_source` | `local` (uploaded zip) — keep this on plain uploads |
+| `external-enabled` | leave empty (Virtual Judge off) |
+| `cases-TOTAL_FORMS/-INITIAL_FORMS/-MIN_NUM_FORMS/-MAX_NUM_FORMS` | management form |
+| `cases-<i>-id` | existing case pk — **echo when modifying** (parse from GET page) |
+| `cases-<i>-order`, `-type` (`C` normal), `-input_file`, `-output_file`, `-points` | case row; file paths are **inside the zip** |
+| `cases-<i>-DELETE` | `on` removes an existing (id-carrying) row |
+
+**Traps (all verified):**
+1. Never send any `problem-data-zipfile-clear` key — its *presence* (even
+   empty) discards the uploaded zip ("Input file for case 1 does not exist").
+2. First upload: `INITIAL_FORMS=0`, no ids. Later edits: parse
+   `TOTAL_FORMS/INITIAL_FORMS/ids` from the GET page and echo them.
+3. > `VNOJ_TESTCASE_HARD_LIMIT` (300) cases needs `judge.create_mass_testcases`;
+   > soft limit 50 shows a warning only.
+4. Success 302s back to the same page. Generated `init.yml`:
+   `GET /problem/<code>/test_data/init`; raw files: `GET /problem/<code>/data/<path>`.
+
+### Polygon import **[V]** (endpoint; package parsing **[C]**)
+`POST /problems/import-polygon` (perm `judge.import_polygon_package`) —
+easiest full upload: `code`, `package` (zip of a Codeforces Polygon export
+containing `problem.xml`, statements, tests, solutions), checkboxes
+`ignore_zero_point_batches`, `ignore_zero_point_cases`,
+`append_main_solution_to_tutorial` (default on), `main_tutorial_language`,
+hidden `do_update`. Update an existing problem:
+`POST /problem/<code>/update-polygon` (same fields; code fixed).
+
+### Other problem ops
+| Op | Call | Perm / note |
+|---|---|---|
+| Clone | `POST /problem/<code>/clone` `code=<new>` **[V]** | `judge.clone_problem`; copies data, sets private |
+| View YAML | `GET /problem/<code>/test_data/init` **[V]** | author/curator |
+| Rejudge | `POST /problem/<code>/manage/submission/rejudge` with `use_range=on&start=&end=`, `language` (multi), `result` (multi) **[C]** | `judge.rejudge_submission_lot` |
+| Rejudge preview | `POST …/rejudge/preview` (same fields) → count **[C]** | |
+| Rescore all | `GET/POST …/rescore/all` **[C]** | author/curator |
+
+## Contests
+
+### Create **[V]**
+`POST /contests/new` (perm `judge.add_contest`):
+
+| Field | Value |
+|---|---|
+| `key` | `^[a-z0-9_]+$`, unique |
+| `name` | display name |
+| `start_time`, `end_time` | `%Y-%m-%d %H:%M:%S` |
+| `is_visible` | checkbox — unchecked = hidden (draft) |
+| `format_name` | `default` / `icpc` / `ioi` / `ioi16` / `atcoder` / `ecoo` / `vnoj` / `final_submission` / `Ultimate` (parse live options) |
+| `scoreboard_visibility` | `V` visible / `C` contest only / `P` after participation / `H` hidden |
+| `description` | Markdown |
+| `is_private`, `private_contestants` | private + user list (PKs via select2 `profile`) |
+| `auto_judge` | checkbox (Final-Submission-Only format) |
+| `contest_problems-TOTAL_FORMS/-INITIAL_FORMS/-MIN_NUM_FORMS/-MAX_NUM_FORMS` | management form |
+| `contest_problems-<i>-problem` / `-points` / `-order` / `-max_submissions` | problem **PK** (select2), points, distinct order, blank = unlimited |
+
+Duration cap: 14 days unless `judge.long_contest_duration` (verified error:
+"Contest duration cannot be longer than 14 days"). Creator becomes **author**.
+
+### Edit **[V]**
+`POST /contest/<key>/edit` (author/curator) — same fields. Problem-list
+reconciliation rules (verified):
+- Existing rows must be echoed with `contest_problems-<i>-id` (from GET page).
+- Removing without echoing the id → *"Contest problem with this Problem and
+  Contest already exists."*
+- Delete a row: echo `id` + `contest_problems-<i>-DELETE=on`.
+- Add rows: empty id, next indices; orders must stay distinct.
+
+### Other contest ops
+| Op | Call | Note |
+|---|---|---|
+| Announce | `POST /contest/<key>/announce` `title`, `description` (Markdown) **[V]** | author/curator; notifies participants |
+| Register | `POST /contest/<key>/register` (empty body; `access_code` if set) **[C]** | before `register_deadline` |
+| Join | `POST /contest/<key>/join` (empty body; `access_code` if set) **[V]** | during contest; after end → virtual join |
+| Leave | `POST /contest/<key>/leave` **[C]** | |
+| Clone | `POST /contest/<key>/clone` `key=<new>` **[C]** | `judge.clone_contest` |
+| Ranking | `GET /contest/<key>/ranking/` HTML (or API detail `rankings`) | |
+| Disqualify | `POST /contest/<key>/participation/disqualify` **[C]** | organizer tools |
+
+## Submissions
+
+| Op | Call | Note |
+|---|---|---|
+| Language list | `GET /problem/<code>/submit` → `<select id="id_language" name="language">` options = `<pk>`/`<name>` **[V]** | Options = problem's `usable_languages` (allowed ∩ judges online). No select rendered = "No judge is available" — cannot submit |
+| Submit | `POST /problem/<code>/submit` `language=<pk>` `source=<code>` **[V]** | or `submission_file` (file upload; extension must match language) + empty `source`. Redirects to `/submission/<id>` |
+| Status | `GET /submission/<id>` HTML; JSON via `/api/v2/submission/<id>` (login required) **[V]** | result codes: `AC` `WA` `TLE` `MLE` `RE` `CE` `IE` …; poll until not `QU`/`P` |
+| Resubmit | same POST (old submissions counted toward `max_submissions`) |
+
+Rate limits: per-problem submission throttling applies between submissions —
+retry on the throttle page/`ignore` message.
+
+## Pages worth scraping (API-less fallbacks)
+
+- `GET /problems/` (+ `?search=`, page params) — problem list HTML.
+- `GET /contests/` — contest list; `GET /contests.ics` — calendar export.
+- `GET /submissions/` (+ filters) — public submission feed.
+- `GET /user/<username>` — profile (rating history JSON embedded).
+
+## Django admin (staff/superuser only) **[C]**
+
+`/admin/` exposes full CRUD over every model (problems, contests, users,
+organizations, judges…). Login flow is the same. Useful for toggles with no
+front-end form (e.g. `is_public` of global problems, contest access codes,
+banning users). Prefer front-end endpoints where they exist — admin forms
+have their own large field sets (out of scope here).
