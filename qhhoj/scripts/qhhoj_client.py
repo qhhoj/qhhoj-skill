@@ -181,13 +181,19 @@ class QhhojClient:
             return row
         raise QhhojError('problem not visible/found: %s' % code)
 
+    def self_profile_pk(self) -> str:
+        """Profile pk of the logged-in user (for `authors` fields)."""
+        rows = self.select2('profile', self.username)
+        for row in rows:
+            return str(row['id'])
+
     # ---------------- problems ----------------
 
     def create_problem(self, code: str, name: str, time_limit_s: float = 1.0,
                        memory_limit_kb: int = 262144, points: int = 800,
                        partial: bool = True, description: str = '',
                        source: str = '', statement_pdf: str = None,
-                       org_path: str = '') -> None:
+                       material: str = None, org_slug: str = '') -> None:
         """POST /problems/create (needs judge.add_problem) or
         /organization/<slug>/problem-create (judge.create_organization_problem).
 
@@ -195,7 +201,8 @@ class QhhojClient:
         created private; org problems get an is_public checkbox (org members).
         Codes: ^[a-z0-9_]+$; org problems must start with <orgslug>_ prefix.
         """
-        path = (org_path or '') + '/problems/create'
+        path = ('/organization/%s/problem-create' % org_slug
+                if org_slug else '/problems/create')
         page = self.get(path)
         if page.status_code != 200:
             raise QhhojError('no access to %s (%s)' % (path, page.status_code))
@@ -212,12 +219,16 @@ class QhhojClient:
             'submission_source_visibility_mode': 'F',
             'testcase_visibility_mode': 'A',
         }
-        if org_path:
+        if org_slug:
             data['is_public'] = ''
-        files = None
+        files = {}
         if statement_pdf:
-            files = {'statement_file': (statement_pdf.split('/')[-1],
-                                        open(statement_pdf, 'rb'), 'application/pdf')}
+            files['statement_file'] = (statement_pdf.split('/')[-1],
+                                       open(statement_pdf, 'rb'), 'application/pdf')
+        if material:
+            files['problem_material_file'] = (material.split('/')[-1],
+                                              open(material, 'rb'), 'application/zip')
+        files = files or None
         r = self.post(path, data, files)
         if r.status_code not in (301, 302):
             raise QhhojError('create_problem failed: %s' % self.form_errors(
@@ -247,11 +258,58 @@ class QhhojClient:
             'description': fields.get('description', ''),
             'submission_source_visibility_mode': 'F',
             'testcase_visibility_mode': 'A',
+        }
+        data.update({
             'language_limits-TOTAL_FORMS': '0', 'language_limits-INITIAL_FORMS': '0',
             'language_limits-MIN_NUM_FORMS': '0', 'language_limits-MAX_NUM_FORMS': '1000',
             'solution-TOTAL_FORMS': '0', 'solution-INITIAL_FORMS': '0',
             'solution-MIN_NUM_FORMS': '0', 'solution-MAX_NUM_FORMS': '1000',
-        }
+        })
+        # --- optional inline formsets (verified semantics) ---
+        # leave-alone default: TOTAL=0/INITIAL=0 keeps existing rows untouched.
+        editorial = fields.get('editorial')          # {'content', 'publish_on'?}
+        lang_limits = fields.get('language_limits')  # [(language_pk, tl_s, ml_kb)]
+        if editorial is not None:
+            sol_ids = dict(re.findall(
+                r'name="solution-(\d+)-id"[^>]*value="(\d+)"', page.text))
+            authors = str(fields.get('author_pk') or self.self_profile_pk())
+            data.update({
+                'solution-TOTAL_FORMS': '1',
+                'solution-INITIAL_FORMS': str(len(sol_ids)),
+                'solution-0-id': sol_ids.get('0', ''),
+                'solution-0-is_public': 'on',
+                'solution-0-publish_on': editorial.get('publish_on', '1970-01-01'),
+                'solution-0-authors': authors,
+                'solution-0-content': editorial['content'],
+            })
+        if lang_limits is not None:
+            ll_ids = dict(re.findall(
+                r'name="language_limits-(\d+)-id"[^>]*value="(\d+)"', page.text))
+            rows = []
+            for i in sorted(ll_ids, key=int):
+                m = re.search(r'name="language_limits-%s-language"[^>]*>(.*?)</select>' % i,
+                              page.text, re.S)
+                cur = self.select_selected(
+                    '<select name="x">%s</select>' % m.group(1), 'x') if m else None
+                keep = next((r for r in lang_limits if str(r[0]) == str(cur)), None)
+                if keep:
+                    rows.append((ll_ids[i], keep[0], keep[1], keep[2]))
+                    lang_limits = [r for r in lang_limits if r is not keep]
+                else:
+                    rows.append((ll_ids[i], cur, 1, 262144, True))  # DELETE
+            for r in lang_limits:
+                rows.append(('', r[0], r[1], r[2]))
+            data['language_limits-TOTAL_FORMS'] = str(len(rows))
+            data['language_limits-INITIAL_FORMS'] = str(len(ll_ids))
+            for i, row in enumerate(rows):
+                data.update({
+                    'language_limits-%d-id' % i: row[0],
+                    'language_limits-%d-language' % i: str(row[1]),
+                    'language_limits-%d-time_limit' % i: str(row[2]),
+                    'language_limits-%d-memory_limit' % i: str(row[3]),
+                })
+                if len(row) > 4 and row[4]:
+                    data['language_limits-%d-DELETE' % i] = 'on'
         r = self.post('/problem/%s/edit' % code, data)
         if r.status_code not in (301, 302):
             raise QhhojError('edit_problem failed: %s' % self.form_errors(r.text))
@@ -321,22 +379,39 @@ class QhhojClient:
                 z.writestr(name, content)
         return out_path
 
-    def import_polygon(self, zip_path: str, code: str) -> None:
-        """POST /problems/import-polygon (judge.import_polygon_package).
-        Package = Codeforces Polygon export zip (contains problem.xml).
-        Creates problem + statement + tests + checkers automatically — the
-        easiest full-upload path. Update existing: /problem/<code>/update-polygon.
+    def import_polygon(self, zip_path: str, code: str, org_slug: str = '',
+                       ignore_zero_point_batches: bool = True) -> None:
+        """POST /problems/import-polygon (judge.import_polygon_package) or
+        /organization/<slug>/import-polygon — org import creates the problem
+        org-private automatically.
+
+        Package = Codeforces Polygon export zip. Server-side requirements
+        (verified): problem.xml with testset name="tests" (time-limit ms,
+        memory-limit bytes, input/answer-path-pattern like 'tests/%d.in'),
+        tests, checker (testlib; std::hcmp/ncmp/wcmp -> standard checker),
+        statement type="application/x-tex" with problem-properties.json next
+        to it, solutions/solution[@tag=main]. Server needs pandoc >= 3.0.
+        Update existing problem: /problem/<code>/update-polygon.
+
+        Gotcha (verified): the `statements` formset management form is
+        REQUIRED even when empty — omitting it fails with
+        "(Hidden field TOTAL_FORMS) This field is required."
         """
+        path = ('/organization/%s/import-polygon' % org_slug
+                if org_slug else '/problems/import-polygon')
         data = {
             'code': code,
-            'ignore_zero_point_batches': '', 'ignore_zero_point_cases': '',
+            'ignore_zero_point_batches': 'on' if ignore_zero_point_batches else '',
+            'ignore_zero_point_cases': '',
             'append_main_solution_to_tutorial': 'on',
             'main_tutorial_language': '',
             'do_update': '',
+            'statements-TOTAL_FORMS': '0', 'statements-INITIAL_FORMS': '0',
+            'statements-MIN_NUM_FORMS': '0', 'statements-MAX_NUM_FORMS': '1000',
         }
         files = {'package': (zip_path.split('/')[-1], open(zip_path, 'rb'),
                              'application/zip')}
-        r = self.post('/problems/import-polygon', data, files)
+        r = self.post(path, data, files)
         if r.status_code not in (301, 302):
             raise QhhojError('polygon import failed: %s' % self.form_errors(r.text))
 
@@ -354,7 +429,7 @@ class QhhojClient:
                        format_name: str = 'default',
                        scoreboard_visibility: str = 'V',
                        visible: bool = False,
-                       problems: list = None, org_path: str = '') -> None:
+                       problems: list = None, org_slug: str = '') -> None:
         """POST /contests/new (judge.add_contest) or /organization/<slug>/contest-create.
 
         problems: [(problem_pk, points)] (pk from select2_problem).
@@ -365,7 +440,8 @@ class QhhojClient:
         scoreboard_visibility: V (visible) | C (contest-only) | P (after partial?)
         | H (hidden) — codes parsed from the live form.
         """
-        path = (org_path or '') + '/contests/new'
+        path = ('/organization/%s/contest-create' % org_slug
+                if org_slug else '/contests/new')
         start = start or datetime.now().replace(microsecond=0)
         end = end or start + timedelta(days=duration_days)
         data = {

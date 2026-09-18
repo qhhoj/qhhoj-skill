@@ -77,11 +77,26 @@ a staff/admin action. Org variant: `POST /organization/<slug>/problem-create`
 ("public to org members"), code must start `<orgslug>_`.
 
 ### Edit **[V]**
-`POST /problem/<code>/edit` — same fields, plus **always** send both inline
-formset management forms:
-`language_limits-TOTAL_FORMS/INITIAL_FORMS/MIN_NUM_FORMS/MAX_NUM_FORMS` and
-`solution-TOTAL_FORMS/…` (`0/0/0/1000` is valid). Omitting them fails with
+`POST /problem/<code>/edit` — same fields (incl. `statement_file` PDF,
+`problem_material_file`), plus **always** send both inline formset management
+forms: `language_limits-TOTAL_FORMS/INITIAL_FORMS/MIN_NUM_FORMS/MAX_NUM_FORMS`
+and `solution-TOTAL_FORMS/…`. Omitting them fails with
 `(Hidden field TOTAL_FORMS) This field is required.`
+
+Verified semantics for the two formsets:
+
+| Intent | `solution-*` (editorial) | `language_limits-*` (per-language TL/ML) |
+|---|---|---|
+| Leave existing rows untouched | `TOTAL_FORMS=0`, `INITIAL_FORMS=0` | same |
+| Create row (none exists yet) | `TOTAL=1/INITIAL=0`, no id | same |
+| Update existing row | echo `solution-0-id` (parse from GET) with `INITIAL_FORMS=1`; re-posting as new → *"Solution with this Associated problem already exists."* | echo `language_limits-<i>-id`; re-posting → *"Language-specific resource limit with this Problem and Language already exists."* |
+| Delete row | id + `solution-0-DELETE=on` | id + `language_limits-<i>-DELETE=on` |
+
+`solution-0-*` fields **[V]**: `is_public` (checkbox), `publish_on`
+(`YYYY-MM-DD`), `authors` (profile PKs — resolve via
+`/judge-select2/profile/?term=<user>`), `content` (Markdown).
+`language_limits-<i>-*` fields **[V]**: `language` (Language pk), `time_limit`
+(**seconds**, float), `memory_limit` (KB).
 
 ### Test data **[V]**
 `GET /problem/<code>/test_data` (author/curator/superuser) then
@@ -114,14 +129,49 @@ formset management forms:
 4. Success 302s back to the same page. Generated `init.yml`:
    `GET /problem/<code>/test_data/init`; raw files: `GET /problem/<code>/data/<path>`.
 
-### Polygon import **[V]** (endpoint; package parsing **[C]**)
+### Polygon import **[V]** (verified end-to-end with a real package)
 `POST /problems/import-polygon` (perm `judge.import_polygon_package`) —
-easiest full upload: `code`, `package` (zip of a Codeforces Polygon export
-containing `problem.xml`, statements, tests, solutions), checkboxes
-`ignore_zero_point_batches`, `ignore_zero_point_cases`,
+easiest full upload: `code`, `package` (zip of a Codeforces Polygon export),
+checkboxes `ignore_zero_point_batches`, `ignore_zero_point_cases`,
 `append_main_solution_to_tutorial` (default on), `main_tutorial_language`,
-hidden `do_update`. Update an existing problem:
+hidden `do_update`. **Plus the `statements` formset management form — required
+even when empty** (`statements-TOTAL_FORMS/INITIAL_FORMS/MIN_NUM_FORMS/
+MAX_NUM_FORMS` = `0/0/0/1000`); without it: `(Hidden field TOTAL_FORMS) This
+field is required.` Update an existing problem:
 `POST /problem/<code>/update-polygon` (same fields; code fixed).
+
+Minimal package structure accepted (verified):
+
+```
+problem.xml            # <testset name="tests"> with time-limit (ms),
+                       #   memory-limit (bytes), input-path-pattern/answer-path-pattern
+                       #   (e.g. tests/%d.in, tests/%d.ans), <tests>, optional <groups>
+                       #   (points-policy each-test|complete-group),
+                       #   <checker type="testlib" name="std::hcmp.cpp"/> (std names
+                       #   map to built-ins: hcmp/ncmp/wcmp=standard, rcmp4/6/9=floats,
+                       #   fcmp=identical; anything else = custom checker source),
+                       #   <statement type="application/x-tex" path=… language=…>,
+                       #   <solutions><solution tag="main"><source …/></solution>
+tests/1.in, tests/1.ans, …
+statements/<lang>/problem-properties.json   # legend/input/output/interaction/
+                       #   scoring/sampleTests/notes/tutorial
+solutions/main.py
+```
+
+Server needs **pandoc ≥ 3.0** (else `pandoc not installed` /
+`pandoc version must be at least 3.0.0`). Import auto-creates statement,
+tests (converted limits), tutorial/editorial, main solution appended as a
+spoiler block.
+
+### Images in Markdown **[V]** (broken on current master)
+`POST /widgets/martor/upload-image`, multipart field `markdown-image-upload`,
+header `X-Requested-With: XMLHttpRequest`, CSRF token taken from any other
+page (this endpoint has no GET form). **Crashes with HTTP 500 on current
+master** — the view calls `request.is_ajax()`, removed in Django 5.1. Works
+only on deployments that patched it. Fallback: host images elsewhere and use
+plain `![alt](https://…)` links in `description`/`content` Markdown.
+Permission when it works: staff or `judge.can_upload_image` (else it proxies
+to Imgur).
 
 ### Other problem ops
 | Op | Call | Perm / note |
@@ -181,7 +231,7 @@ reconciliation rules (verified):
 | Language list | `GET /problem/<code>/submit` → `<select id="id_language" name="language">` options = `<pk>`/`<name>` **[V]** | Options = problem's `usable_languages` (allowed ∩ judges online). No select rendered = "No judge is available" — cannot submit |
 | Submit | `POST /problem/<code>/submit` `language=<pk>` `source=<code>` **[V]** | or `submission_file` (file upload; extension must match language) + empty `source`. Redirects to `/submission/<id>` |
 | Status | `GET /submission/<id>` HTML; JSON via `/api/v2/submission/<id>` (login required) **[V]** | result codes: `AC` `WA` `TLE` `MLE` `RE` `CE` `IE` …; poll until not `QU`/`P` |
-| Resubmit | same POST (old submissions counted toward `max_submissions`) |
+| Status row fragment | `GET /widgets/single_submission?id=<id>&show_problem=1` **[V]** (path) | HTML row incl. verdict; works when API off; also `GET /widgets/submission_testcases?id=<id>` for case results |
 
 Rate limits: per-problem submission throttling applies between submissions —
 retry on the throttle page/`ignore` message.
@@ -200,3 +250,24 @@ organizations, judges…). Login flow is the same. Useful for toggles with no
 front-end form (e.g. `is_public` of global problems, contest access codes,
 banning users). Prefer front-end endpoints where they exist — admin forms
 have their own large field sets (out of scope here).
+
+## Organizations (private group content) **[V]**
+
+Access rule (`AdminOrganizationMixin`): the account must be an **admin of the
+org** (`org.is_admin(profile)`) or hold `judge.edit_all_organization`. Org
+admins are granted capabilities through the Django group **`Org Admin`**
+(setting `GROUP_PERMISSION_FOR_ORG_ADMIN`) — the site adds every org admin to
+that group whenever the org is saved.
+
+| Op | Call | Notes |
+|---|---|---|
+| Org problem create | `POST /organization/<slug>/problem-create` | same fields as global create + `is_public` (visible to org members); `code` must start `<orgslug>_`; problem auto org-private, author = you; perm `judge.create_organization_problem` |
+| Org Polygon import | `POST /organization/<slug>/import-polygon` | same fields (incl. `statements-*` mgmt); problem auto org-private; perm `judge.import_polygon_package` |
+| Org contest create | `POST /organization/<slug>/contest-create` | same fields as contest create; `key` must start `<orgslug>_`; contest auto org-private; perm **`judge.create_private_contest`** (not `create_organization_contest`!) |
+| Org blog post | `POST /organization/<slug>/post/new` **[C]** | `title`, `publish_on`, `visible`, `content`; perm `judge.edit_organization_post` |
+| Org listings | `GET /organization/<slug>/problems`, `/contests`, `/submissions` | org-scoped lists |
+| Discover orgs | `GET /api/v2/organizations`, `/judge-select2/organization/?term=` | then probe `GET /organization/<slug>/problem-create` (200 = you may create) |
+
+Verified probe results as org admin with the `Org Admin` group: all three
+create endpoints answer 200; creating yields `is_organization_private: true`
+via `/api/v2/problem/<code>`.

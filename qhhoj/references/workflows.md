@@ -135,8 +135,8 @@ while True:
     time.sleep(2)
 ```
 API-less fallback: `GET /submission/<id>` HTML (status badge), or the row
-fragment `GET /submission/widgets/single_submission?id=<id>` returning the
-status table row HTML (auth needed; works when `/api/v2` is disabled).
+fragment `GET /widgets/single_submission?id=<id>` returning the status table
+row HTML (auth needed; works when `/api/v2` is disabled).
 
 ## 9. Read site data (problems/contests/users/rankings)
 
@@ -147,17 +147,43 @@ detail = c.api('contest/voi25')['object']   # problems[] + rankings[] (if allowe
 If `c.api(...)` returns None (feature flag off), scrape the HTML list pages
 (`/problems/`, `/contests/`, `/submissions/`, `/user/<name>/`).
 
-## 10. Organization-scoped work
+## 10. Organization-scoped work (org-private content) **[V]**
 
-Org admins create content inside their org (auto-prefixed ids, org-private
-visibility):
-- `POST /organization/<slug>/problem-create` — like problem create + `is_public`
-  (org-visibility) checkbox; `code` must start `<orgslug>_`.
-- `POST /organization/<slug>/contest-create` — like contest create; `key` must
-  start `<orgslug>_`.
-- `GET /organization/<slug>/problems|contests` — org listings.
-Client: pass `org_path='/organization/<slug>'` to `create_problem` /
-`create_contest`.
+Who can: **org admins** (auto-added to the `Org Admin` group carrying the
+create permissions) or holders of `judge.edit_all_organization`.
+
+```python
+# discover orgs, then confirm create rights (200 = allowed, 403 = no)
+for org in c.api('organizations')['objects']:
+    r = c.get('/organization/%s/problem-create' % org['key'])  # slug
+    if r.status_code == 200: print('can upload to', org['key'])
+
+c.create_problem(code='myorg_p1', name='P1', org_slug='myorg',
+                 statement_pdf='statement.pdf',   # PDF statement (perm-gated)
+                 material='materials.zip',        # contestant materials
+                 description='## Đề\n...')        # code auto-required prefix myorg_
+c.import_polygon('polygon.zip', 'myorg_p2', org_slug='myorg')  # org-private, one shot
+c.create_contest(key='myorg_cont', name='Cont', org_slug='myorg',
+                 problems=[(c.select2_problem('myorg_p1')['id'], 100)])
+```
+
+Org content is born **org-private** (`is_organization_private=true`) even with
+`is_public` on — "public" means visible to org members. Org listings:
+`GET /organization/<slug>/problems|contests|submissions`.
+
+Editorial (lời giải) and per-language limits on any problem you curate:
+
+```python
+c.edit_problem('myorg_p1',
+               editorial={'content': '## Lời giải\n...'})         # creates/updates
+c.edit_problem('myorg_p1', language_limits=[(cpp_pk, 3, 131072)])  # (lang, s, KB)
+# omit both → existing rows untouched (TOTAL=0 semantics, verified)
+```
+
+Images inside statements: the built-in uploader
+(`/widgets/martor/upload-image`) 500s on current master (Django 5.1 removed
+`request.is_ajax()`), so host images externally and embed with
+`![alt](https://…)`.
 
 ## 11. Rejudge / rescore after fixing tests (author tools) **[C]**
 

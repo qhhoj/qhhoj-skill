@@ -27,14 +27,21 @@ Enforcement: `PermissionRequiredMixin` (403 page), `LoginRequiredMixin`
 | Rejudge lots | `judge.rejudge_submission_lot` |
 | See private problems/contests | `judge.see_private_problem` / `judge.see_private_contest` |
 | Edit all problems / contests | `judge.edit_all_problem` / `judge.edit_all_contest` |
-| Org problem/contest create | `judge.create_organization_problem` / `judge.create_organization_contest` |
+| Org problem create (`/organization/<s>/problem-create`) | org admin + `judge.create_organization_problem` |
+| Org Polygon import (`/organization/<s>/import-polygon`) | org admin + `judge.import_polygon_package` |
+| Org contest create (`/organization/<s>/contest-create`) | org admin + **`judge.create_private_contest`** (not `create_organization_contest`) |
+| Org blog post | org admin + `judge.edit_organization_post` |
 | Upload PDF statement / materials | `judge.upload_file_statement` / `judge.upload_problem_material` |
+| Markdown image upload | staff or `judge.can_upload_image` (endpoint broken on master — see endpoints.md) |
+| Edit any organization | `judge.edit_all_organization` |
 | Spam-rejudge submission | `judge.rejudge_submission` |
 | Any admin action (`/admin/`) | `is_staff` (+ per-model perms) / superuser |
 
 Superuser implicitly holds everything. Typical site roles: "Problem Setter"
 group gets add/edit-own problem perms; "Contest Organizer" gets add/edit-own
-contest perms.
+contest perms; **org admins are auto-added to the `Org Admin` group** (site
+does this when the org is saved) which is where their create permissions come
+from.
 
 ## Numeric limits (defaults; per-site overridable)
 
@@ -50,7 +57,9 @@ contest perms.
 Verified error texts (safe to match): "Contest duration cannot be longer than
 14 days", "Input file for case 1 does not exist", "(Hidden field TOTAL_FORMS)
 This field is required.", "Contest problem with this Problem and Contest
-already exists.".
+already exists.", "Solution with this Associated problem already exists.",
+"Language-specific resource limit with this Problem and Language already
+exists.", "pandoc version must be at least 3.0.0".
 
 ## Troubleshooting matrix
 
@@ -65,7 +74,10 @@ already exists.".
 | "Contest problem … already exists" | edit dropped row ids | echo `contest_problems-<i>-id`, use `-DELETE=on` for removals |
 | No `<select id="id_language">` on submit page | no judge online serving the problem | wait for a judge; site-side admins must connect judge servers |
 | Submission stuck `QU`/`P` | judge queue busy/offline | poll longer; check `GET /api/v2/judges` |
-| `POST` works in browser but 403 via client | missing `Referer` header (CSRF) or HTTPS `Origin` mismatch | send `Referer: <site><path>`; for HTTPS cross-origin setups ask admin to add client origin to `CSRF_TRUSTED_ORIGINS` |
+| "Solution/Language-specific … already exists" | re-posted an existing editorial/lang-limit row as new | echo the row's `id` with correct `INITIAL_FORMS`, or send `TOTAL_FORMS=0` to leave untouched |
+| Org create page 403 | not an admin of that org (or missing `Org Admin` group perms) | org admin must add you; superusers bypass |
+| Polygon import 500 / `pandoc not installed` | server lacks pandoc ≥ 3.0 | site-side: `apt install pandoc`; use manual upload path meanwhile |
+| Image upload 500 (`is_ajax` AttributeError) | known bug on current master (Django 5.1) | host images externally; embed via Markdown URL |
 | API returns 404 | `VNOJ_ENABLE_API=False` | use HTML fallbacks (workflows §9) |
 | Select2 finds nothing for a code | problem not visible to you (private/organization) | different account, or get added as tester/curator |
 
